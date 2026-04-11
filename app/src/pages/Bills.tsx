@@ -9,7 +9,7 @@ import {
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from '@/components/ui/table'
-import { FileText, ChevronLeft, AlertTriangle, CheckCircle2, Clock, XCircle, RefreshCw, Loader2 } from 'lucide-react'
+import { FileText, ChevronLeft, AlertTriangle, CheckCircle2, Clock, XCircle, RefreshCw, Loader2, Mail } from 'lucide-react'
 
 const fmt = (n: number) =>
   n.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
@@ -24,8 +24,18 @@ type Bill = {
   status: string
   error_message: string | null
   drive_file_name: string | null
+  email_from: string | null
+  email_subject: string | null
+  source: string | null
   created_at: string
   vendors: { name: string } | null
+}
+
+// Supabase returns joined relations as arrays; normalize to single object
+function normalizeBill(raw: Record<string, unknown>): Bill {
+  const r = { ...raw } as Record<string, unknown>
+  if (Array.isArray(r.vendors)) r.vendors = r.vendors[0] ?? null
+  return r as unknown as Bill
 }
 
 type LineItem = {
@@ -66,17 +76,21 @@ function StatusBadge({ status }: { status: string }) {
   )
 }
 
-function ConfidenceBadge({ confidence }: { confidence: number | null }) {
-  if (confidence === null) return <span className="text-muted-foreground">—</span>
-  const pct = Math.round(confidence * 100)
-  if (pct >= 90) return <Badge variant="secondary">{pct}%</Badge>
-  if (pct >= 70) return <Badge variant="outline" className="text-amber-600 border-amber-400">{pct}%</Badge>
-  return <Badge variant="outline" className="text-destructive border-destructive/40">{pct}%</Badge>
-}
-
 // ── Bill List ───────────────────────────────────────────────────────────────
 
-function ScanButton({ onComplete }: { onComplete: () => void }) {
+function ScanButton({
+  onComplete,
+  fn,
+  label,
+  activeLabel,
+  icon: Icon,
+}: {
+  onComplete: () => void
+  fn: string
+  label: string
+  activeLabel: string
+  icon: typeof RefreshCw
+}) {
   const [scanning, setScanning] = useState(false)
   const [result, setResult] = useState<{ message: string; isError: boolean } | null>(null)
 
@@ -84,7 +98,7 @@ function ScanButton({ onComplete }: { onComplete: () => void }) {
     setScanning(true)
     setResult(null)
     try {
-      const { data, error } = await supabase.functions.invoke('scan-genie')
+      const { data, error } = await supabase.functions.invoke(fn)
       if (error) throw error
       setResult({ message: data.message, isError: false })
       onComplete()
@@ -101,15 +115,36 @@ function ScanButton({ onComplete }: { onComplete: () => void }) {
         {scanning ? (
           <Loader2 className="size-3.5 mr-1.5 animate-spin" />
         ) : (
-          <RefreshCw className="size-3.5 mr-1.5" />
+          <Icon className="size-3.5 mr-1.5" />
         )}
-        {scanning ? 'Scanning Genie folder...' : 'Scan for new invoices'}
+        {scanning ? activeLabel : label}
       </Button>
       {result && (
         <p className={`text-sm ${result.isError ? 'text-destructive' : 'text-muted-foreground'}`}>
           {result.message}
         </p>
       )}
+    </div>
+  )
+}
+
+function ScanButtons({ onComplete }: { onComplete: () => void }) {
+  return (
+    <div className="flex items-center gap-2">
+      <ScanButton
+        onComplete={onComplete}
+        fn="scan-genie"
+        label="Scan Drive"
+        activeLabel="Scanning Drive..."
+        icon={RefreshCw}
+      />
+      <ScanButton
+        onComplete={onComplete}
+        fn="scan-email"
+        label="Scan Email"
+        activeLabel="Scanning email..."
+        icon={Mail}
+      />
     </div>
   )
 }
@@ -125,13 +160,13 @@ function BillList({ onSelect }: { onSelect: (id: number) => void }) {
       setLoading(true)
       let query = supabase
         .from('bills')
-        .select('id, invoice_number, invoice_date, due_date, total_amount, status, error_message, drive_file_name, created_at, vendors(name)')
+        .select('id, vendor_id, invoice_number, invoice_date, due_date, total_amount, status, error_message, drive_file_name, email_from, email_subject, source, created_at, vendors(name)')
         .order('created_at', { ascending: false })
 
       if (filter) query = query.eq('status', filter)
 
       const { data } = await query
-      setBills((data as Bill[]) || [])
+      setBills((data || []).map((d: Record<string, unknown>) => normalizeBill(d)))
       setLoading(false)
     }
     load()
@@ -146,13 +181,13 @@ function BillList({ onSelect }: { onSelect: (id: number) => void }) {
   if (bills.length === 0 && !filter) {
     return (
       <div className="space-y-4">
-        <ScanButton onComplete={reload} />
+        <ScanButtons onComplete={reload} />
         <Card>
           <CardContent className="py-12 text-center">
             <FileText className="size-10 mx-auto mb-3 text-muted-foreground/40" />
             <h3 className="font-medium mb-1">No bills yet</h3>
             <p className="text-sm text-muted-foreground max-w-sm mx-auto">
-              Hit "Scan for new invoices" above to check the Genie folder for new invoices to process.
+              Scan the Genie Drive folder or billing email inbox to pull in new invoices.
             </p>
           </CardContent>
         </Card>
@@ -184,7 +219,7 @@ function BillList({ onSelect }: { onSelect: (id: number) => void }) {
           </Button>
         ))}
         </div>
-        <ScanButton onComplete={reload} />
+        <ScanButtons onComplete={reload} />
       </div>
 
       <Card>
@@ -196,7 +231,7 @@ function BillList({ onSelect }: { onSelect: (id: number) => void }) {
               <TableHead>Date</TableHead>
               <TableHead className="text-right">Amount</TableHead>
               <TableHead>Status</TableHead>
-              <TableHead>File</TableHead>
+              <TableHead>Source</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -222,7 +257,9 @@ function BillList({ onSelect }: { onSelect: (id: number) => void }) {
                   <StatusBadge status={bill.status} />
                 </TableCell>
                 <TableCell className="text-sm text-muted-foreground truncate max-w-[160px]">
-                  {bill.drive_file_name || '—'}
+                  {bill.source === 'email'
+                    ? bill.email_subject || bill.email_from || 'Email'
+                    : bill.drive_file_name || '—'}
                 </TableCell>
               </TableRow>
             ))}
@@ -248,7 +285,7 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
       const [billRes, linesRes, acctRes] = await Promise.all([
         supabase
           .from('bills')
-          .select('id, invoice_number, invoice_date, due_date, total_amount, status, error_message, drive_file_name, created_at, vendor_id, vendors(name)')
+          .select('id, invoice_number, invoice_date, due_date, total_amount, status, error_message, drive_file_name, email_from, email_subject, source, created_at, vendor_id, vendors(name)')
           .eq('id', billId)
           .single(),
         supabase
@@ -261,8 +298,12 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
           .select('id, name, account_number')
           .order('account_number'),
       ])
-      setBill(billRes.data as Bill)
-      setLines((linesRes.data as LineItem[]) || [])
+      setBill(billRes.data ? normalizeBill(billRes.data as Record<string, unknown>) : null)
+      setLines((linesRes.data || []).map((d: Record<string, unknown>) => {
+        const r = { ...d } as Record<string, unknown>
+        if (Array.isArray(r.qbo_accounts)) r.qbo_accounts = r.qbo_accounts[0] ?? null
+        return r as unknown as LineItem
+      }))
       setAccounts((acctRes.data as QboAccount[]) || [])
       setLoading(false)
     }
@@ -385,8 +426,16 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
             <dd>{bill.due_date || '—'}</dd>
             <dt className="text-muted-foreground">Total</dt>
             <dd className="font-semibold">{bill.total_amount !== null ? fmt(bill.total_amount) : '—'}</dd>
-            <dt className="text-muted-foreground">Source File</dt>
-            <dd className="truncate">{bill.drive_file_name || '—'}</dd>
+            <dt className="text-muted-foreground">Source</dt>
+            <dd className="truncate">
+              {bill.source === 'email' ? (
+                <span title={bill.email_from || undefined}>
+                  {bill.email_subject || bill.email_from || 'Email'}
+                </span>
+              ) : (
+                bill.drive_file_name || '—'
+              )}
+            </dd>
           </dl>
         </CardContent>
       </Card>
