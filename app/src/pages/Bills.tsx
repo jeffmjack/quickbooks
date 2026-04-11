@@ -9,7 +9,8 @@ import {
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from '@/components/ui/table'
-import { FileText, ChevronLeft, AlertTriangle, CheckCircle2, Clock, XCircle, RefreshCw, Loader2, Mail } from 'lucide-react'
+import { Input } from '@/components/ui/input'
+import { FileText, ChevronLeft, AlertTriangle, CheckCircle2, Clock, XCircle, RefreshCw, Loader2, Mail, Link2, Plus } from 'lucide-react'
 
 const fmt = (n: number) =>
   n.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
@@ -23,12 +24,15 @@ type Bill = {
   total_amount: number | null
   status: string
   error_message: string | null
+  drive_file_id: string | null
   drive_file_name: string | null
+  email_message_id: string | null
   email_from: string | null
   email_subject: string | null
   source: string | null
   created_at: string
-  vendors: { name: string } | null
+  raw_extraction: { vendor_name?: string } | null
+  vendors: { name: string; qbo_vendor_id: string | null } | null
 }
 
 // Supabase returns joined relations as arrays; normalize to single object
@@ -56,6 +60,173 @@ type QboAccount = {
   id: number
   name: string
   account_number: string | null
+}
+
+// Simple Levenshtein similarity for vendor suggestion
+function similarity(a: string, b: string): number {
+  const al = a.toLowerCase(), bl = b.toLowerCase()
+  if (al === bl) return 1
+  const len = Math.max(al.length, bl.length)
+  if (len === 0) return 1
+  const matrix: number[][] = []
+  for (let i = 0; i <= al.length; i++) { matrix[i] = [i] }
+  for (let j = 0; j <= bl.length; j++) { matrix[0][j] = j }
+  for (let i = 1; i <= al.length; i++) {
+    for (let j = 1; j <= bl.length; j++) {
+      matrix[i][j] = al[i - 1] === bl[j - 1]
+        ? matrix[i - 1][j - 1]
+        : Math.min(matrix[i - 1][j - 1] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j] + 1)
+    }
+  }
+  return 1 - matrix[al.length][bl.length] / len
+}
+
+type QboVendor = { id: number; name: string; qbo_vendor_id: string }
+
+function VendorLinker({
+  vendorId,
+  vendorName,
+  onLinked,
+}: {
+  vendorId: number
+  vendorName: string
+  onLinked: (qboVendorId: string) => void
+}) {
+  const [qboVendors, setQboVendors] = useState<QboVendor[]>([])
+  const [search, setSearch] = useState('')
+  const [linking, setLinking] = useState(false)
+  const [creating, setCreating] = useState(false)
+  const [result, setResult] = useState<{ message: string; isError: boolean } | null>(null)
+
+  useEffect(() => {
+    supabase
+      .from('vendors')
+      .select('id, name, qbo_vendor_id')
+      .not('qbo_vendor_id', 'is', null)
+      .order('name')
+      .then(({ data }) => setQboVendors((data || []) as QboVendor[]))
+  }, [])
+
+  // Sort by similarity to vendor name, then filter by search
+  const ranked = qboVendors
+    .map((v) => ({ ...v, score: similarity(vendorName, v.name) }))
+    .sort((a, b) => b.score - a.score)
+  const filtered = search
+    ? ranked.filter((v) => v.name.toLowerCase().includes(search.toLowerCase()))
+    : ranked.slice(0, 8)
+
+  const bestMatch = ranked.length > 0 && ranked[0].score >= 0.5 ? ranked[0] : null
+
+  const linkVendor = async (qboVendorId: string) => {
+    setLinking(true)
+    setResult(null)
+    try {
+      const { data, error } = await supabase.functions.invoke('link-vendor', {
+        body: { vendorId, qboVendorId },
+      })
+      if (error) {
+        const body = error.context ? await error.context.json().catch(() => null) : null
+        throw new Error(body?.error || error.message || `${error}`)
+      }
+      setResult({ message: data.message, isError: false })
+      onLinked(qboVendorId)
+    } catch (e: any) {
+      setResult({ message: e.message || `Link failed: ${e}`, isError: true })
+    } finally {
+      setLinking(false)
+    }
+  }
+
+  const createVendor = async () => {
+    setCreating(true)
+    setResult(null)
+    try {
+      const { data, error } = await supabase.functions.invoke('link-vendor', {
+        body: { vendorId, createInQbo: true, createName: vendorName },
+      })
+      if (error) {
+        const body = error.context ? await error.context.json().catch(() => null) : null
+        throw new Error(body?.error || error.message || `${error}`)
+      }
+      setResult({ message: data.message, isError: false })
+      onLinked(data.qbo_vendor_id)
+    } catch (e: any) {
+      setResult({ message: e.message || `Create failed: ${e}`, isError: true })
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  return (
+    <Card className="border-amber-400">
+      <CardContent className="py-4 space-y-3">
+        <div className="flex items-start gap-2 text-amber-600">
+          <AlertTriangle className="size-4 mt-0.5 shrink-0" />
+          <p className="text-sm font-medium">
+            "{vendorName}" is not linked to a QBO vendor
+          </p>
+        </div>
+
+        {bestMatch && (
+          <div className="flex items-center gap-2">
+            <p className="text-sm text-muted-foreground">Best match:</p>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => linkVendor(bestMatch.qbo_vendor_id)}
+              disabled={linking}
+            >
+              <Link2 className="size-3.5 mr-1.5" />
+              {bestMatch.name}
+              <span className="ml-1 text-muted-foreground">({Math.round(bestMatch.score * 100)}%)</span>
+            </Button>
+          </div>
+        )}
+
+        <div className="space-y-2">
+          <Input
+            placeholder="Search QBO vendors..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="h-8 text-sm"
+          />
+          {filtered.length > 0 && (
+            <div className="max-h-40 overflow-y-auto border rounded-md divide-y text-sm">
+              {filtered.map((v) => (
+                <button
+                  key={v.id}
+                  className="w-full text-left px-3 py-1.5 hover:bg-muted/50 flex items-center justify-between disabled:opacity-50"
+                  onClick={() => linkVendor(v.qbo_vendor_id)}
+                  disabled={linking}
+                >
+                  <span>{v.name}</span>
+                  <span className="text-muted-foreground text-xs">{Math.round(v.score * 100)}%</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center gap-3 pt-1">
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={createVendor}
+            disabled={creating || linking}
+          >
+            {creating ? <Loader2 className="size-3.5 mr-1.5 animate-spin" /> : <Plus className="size-3.5 mr-1.5" />}
+            Create "{vendorName}" in QBO
+          </Button>
+        </div>
+
+        {result && (
+          <p className={`text-sm ${result.isError ? 'text-destructive' : 'text-muted-foreground'}`}>
+            {result.message}
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  )
 }
 
 const STATUS_CONFIG: Record<string, { label: string; variant: 'default' | 'secondary' | 'outline'; className?: string; icon: typeof Clock }> = {
@@ -99,11 +270,15 @@ function ScanButton({
     setResult(null)
     try {
       const { data, error } = await supabase.functions.invoke(fn)
-      if (error) throw error
+      if (error) {
+        // Extract the response body from FunctionsHttpError
+        const body = error.context ? await error.context.json().catch(() => null) : null
+        throw new Error(body?.error || error.message || `${error}`)
+      }
       setResult({ message: data.message, isError: false })
       onComplete()
-    } catch (e) {
-      setResult({ message: `Scan failed: ${e}`, isError: true })
+    } catch (e: any) {
+      setResult({ message: e.message || `Scan failed: ${e}`, isError: true })
     } finally {
       setScanning(false)
     }
@@ -160,7 +335,7 @@ function BillList({ onSelect }: { onSelect: (id: number) => void }) {
       setLoading(true)
       let query = supabase
         .from('bills')
-        .select('id, vendor_id, invoice_number, invoice_date, due_date, total_amount, status, error_message, drive_file_name, email_from, email_subject, source, created_at, vendors(name)')
+        .select('id, vendor_id, invoice_number, invoice_date, due_date, total_amount, status, error_message, drive_file_id, drive_file_name, email_message_id, email_from, email_subject, source, created_at, vendors(name, qbo_vendor_id)')
         .order('created_at', { ascending: false })
 
       if (filter) query = query.eq('status', filter)
@@ -257,9 +432,32 @@ function BillList({ onSelect }: { onSelect: (id: number) => void }) {
                   <StatusBadge status={bill.status} />
                 </TableCell>
                 <TableCell className="text-sm text-muted-foreground truncate max-w-[160px]">
-                  {bill.source === 'email'
+                  {bill.drive_file_id ? (
+                    <a
+                      href={`https://drive.google.com/file/d/${bill.drive_file_id}/view`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="hover:underline text-blue-600"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {bill.source === 'email'
+                        ? bill.email_subject || bill.email_from || 'Email'
+                        : bill.drive_file_name || 'View file'}
+                    </a>
+                  ) : bill.email_message_id ? (
+                    <a
+                      href={`https://mail.google.com/mail/u/0/#inbox/${bill.email_message_id}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="hover:underline text-blue-600"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {bill.email_subject || bill.email_from || 'Email'}
+                    </a>
+                  ) : bill.source === 'email'
                     ? bill.email_subject || bill.email_from || 'Email'
-                    : bill.drive_file_name || '—'}
+                    : bill.drive_file_name || '—'
+                  }
                 </TableCell>
               </TableRow>
             ))}
@@ -285,7 +483,7 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
       const [billRes, linesRes, acctRes] = await Promise.all([
         supabase
           .from('bills')
-          .select('id, invoice_number, invoice_date, due_date, total_amount, status, error_message, drive_file_name, email_from, email_subject, source, created_at, vendor_id, vendors(name)')
+          .select('id, invoice_number, invoice_date, due_date, total_amount, status, error_message, drive_file_id, drive_file_name, email_message_id, email_from, email_subject, source, raw_extraction, created_at, vendor_id, vendors(name, qbo_vendor_id)')
           .eq('id', billId)
           .single(),
         supabase
@@ -369,9 +567,38 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
     setSaveMsg('Saved')
   }, [lines, accounts, bill, billId])
 
+  const [posting, setPosting] = useState(false)
+  const [postResult, setPostResult] = useState<{ message: string; isError: boolean } | null>(null)
+
   const markReviewed = async () => {
     await supabase.from('bills').update({ status: 'reviewed' }).eq('id', billId)
     setBill((prev) => prev ? { ...prev, status: 'reviewed' } : prev)
+  }
+
+  const postToQBO = async () => {
+    setPosting(true)
+    setPostResult(null)
+    try {
+      const { data, error } = await supabase.functions.invoke('post-bill', {
+        body: { billId },
+      })
+      if (error) {
+        const body = error.context ? await error.context.json().catch(() => null) : null
+        throw new Error(body?.error || error.message || `${error}`)
+      }
+      setPostResult({ message: data.message, isError: false })
+      setBill((prev) => prev ? { ...prev, status: 'posted', qbo_bill_id: data.qbo_bill_id } : prev)
+    } catch (e: any) {
+      setPostResult({ message: e.message || `Post failed: ${e}`, isError: true })
+    } finally {
+      setPosting(false)
+    }
+  }
+
+  const reviewAndPost = async () => {
+    await supabase.from('bills').update({ status: 'reviewed' }).eq('id', billId)
+    setBill((prev) => prev ? { ...prev, status: 'reviewed' } : prev)
+    await postToQBO()
   }
 
   if (loading || !bill) {
@@ -392,10 +619,31 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
           </h2>
           <p className="text-sm text-muted-foreground">
             Invoice {bill.invoice_number || '—'} &middot; {bill.invoice_date || 'No date'}
+            {bill.vendors?.qbo_vendor_id
+              ? <span className="ml-2">&middot; QBO linked</span>
+              : <span className="ml-2 text-amber-600">&middot; Not linked to QBO</span>
+            }
           </p>
+          {bill.raw_extraction?.vendor_name && bill.raw_extraction.vendor_name !== bill.vendors?.name && (
+            <p className="text-xs text-muted-foreground">Name on bill: {bill.raw_extraction.vendor_name}</p>
+          )}
         </div>
         <StatusBadge status={bill.status} />
       </div>
+
+      {/* Vendor linking */}
+      {bill.vendor_id && !bill.vendors?.qbo_vendor_id && (
+        <VendorLinker
+          vendorId={bill.vendor_id}
+          vendorName={bill.vendors?.name || 'Unknown'}
+          onLinked={(qboVendorId) => {
+            setBill((prev) => prev ? {
+              ...prev,
+              vendors: { ...prev.vendors!, qbo_vendor_id: qboVendorId },
+            } : prev)
+          }}
+        />
+      )}
 
       {/* Warnings */}
       {unmapped.length > 0 && (
@@ -428,7 +676,27 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
             <dd className="font-semibold">{bill.total_amount !== null ? fmt(bill.total_amount) : '—'}</dd>
             <dt className="text-muted-foreground">Source</dt>
             <dd className="truncate">
-              {bill.source === 'email' ? (
+              {bill.drive_file_id ? (
+                <a
+                  href={`https://drive.google.com/file/d/${bill.drive_file_id}/view`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:underline text-blue-600"
+                >
+                  {bill.source === 'email'
+                    ? bill.email_subject || bill.email_from || 'Email'
+                    : bill.drive_file_name || 'View file'}
+                </a>
+              ) : bill.email_message_id ? (
+                <a
+                  href={`https://mail.google.com/mail/u/0/#inbox/${bill.email_message_id}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:underline text-blue-600"
+                >
+                  {bill.email_subject || bill.email_from || 'Email'}
+                </a>
+              ) : bill.source === 'email' ? (
                 <span title={bill.email_from || undefined}>
                   {bill.email_subject || bill.email_from || 'Email'}
                 </span>
@@ -474,6 +742,7 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
               <TableRow>
                 <TableHead className="w-8">#</TableHead>
                 <TableHead>Description</TableHead>
+                <TableHead>Item #</TableHead>
                 <TableHead className="text-right">Qty</TableHead>
                 <TableHead className="text-right">Ext. Price</TableHead>
                 <TableHead className="w-[200px]">Category</TableHead>
@@ -487,12 +756,10 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
                   <TableRow key={line.id}>
                     <TableCell className="text-muted-foreground">{line.line_number}</TableCell>
                     <TableCell>
-                      <div className="max-w-[300px]">
-                        <p className="truncate text-sm">{line.description || '—'}</p>
-                        {line.sku && (
-                          <p className="text-xs text-muted-foreground font-mono">{line.sku}</p>
-                        )}
-                      </div>
+                      <p className="truncate text-sm max-w-[300px]">{line.description || '—'}</p>
+                    </TableCell>
+                    <TableCell className="font-mono text-sm text-muted-foreground">
+                      {line.sku || '—'}
                     </TableCell>
                     <TableCell className="text-right text-sm">
                       {line.quantity !== null ? `${line.quantity} ${line.unit || ''}`.trim() : '—'}
@@ -529,7 +796,7 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
               })}
               {lines.length > 0 && (
                 <TableRow className="font-semibold border-t-2">
-                  <TableCell colSpan={3} className="text-right">Total</TableCell>
+                  <TableCell colSpan={4} className="text-right">Total</TableCell>
                   <TableCell className="text-right font-mono">
                     {bill.total_amount !== null ? fmt(bill.total_amount) : '—'}
                   </TableCell>
@@ -542,15 +809,34 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
       </Card>
 
       {/* Actions */}
-      {bill.status === 'pending' && (
-        <div className="flex gap-3">
-          <Button onClick={markReviewed} disabled={unmapped.length > 0}>
-            <CheckCircle2 className="size-4 mr-1.5" />
-            Mark as Reviewed
-          </Button>
+      {(bill.status === 'pending' || bill.status === 'reviewed') && (
+        <div className="flex flex-wrap gap-3 items-center">
+          {bill.status === 'pending' && (
+            <>
+              <Button onClick={reviewAndPost} disabled={unmapped.length > 0 || posting}>
+                {posting ? <Loader2 className="size-4 mr-1.5 animate-spin" /> : <CheckCircle2 className="size-4 mr-1.5" />}
+                Review & Post to QBO
+              </Button>
+              <Button variant="outline" onClick={markReviewed} disabled={unmapped.length > 0}>
+                <CheckCircle2 className="size-4 mr-1.5" />
+                Mark as Reviewed
+              </Button>
+            </>
+          )}
+          {bill.status === 'reviewed' && (
+            <Button onClick={postToQBO} disabled={unmapped.length > 0 || posting}>
+              {posting ? <Loader2 className="size-4 mr-1.5 animate-spin" /> : <CheckCircle2 className="size-4 mr-1.5" />}
+              Post to QBO
+            </Button>
+          )}
           {unmapped.length > 0 && (
-            <p className="text-sm text-muted-foreground self-center">
-              Assign all categories before marking as reviewed
+            <p className="text-sm text-muted-foreground">
+              Assign all categories before posting
+            </p>
+          )}
+          {postResult && (
+            <p className={`text-sm ${postResult.isError ? 'text-destructive' : 'text-muted-foreground'}`}>
+              {postResult.message}
             </p>
           )}
         </div>
