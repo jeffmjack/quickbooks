@@ -446,7 +446,7 @@ function BillList({ onSelect }: { onSelect: (id: number) => void }) {
                     </a>
                   ) : bill.email_message_id ? (
                     <a
-                      href={`https://mail.google.com/mail/u/0/#inbox/${bill.email_message_id}`}
+                      href={`https://mail.google.com/mail/?authuser=billing@thegreencart.com#inbox/${bill.email_message_id}`}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="hover:underline text-blue-600"
@@ -689,7 +689,7 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
                 </a>
               ) : bill.email_message_id ? (
                 <a
-                  href={`https://mail.google.com/mail/u/0/#inbox/${bill.email_message_id}`}
+                  href={`https://mail.google.com/mail/?authuser=billing@thegreencart.com#inbox/${bill.email_message_id}`}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="hover:underline text-blue-600"
