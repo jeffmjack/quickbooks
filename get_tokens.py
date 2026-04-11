@@ -103,13 +103,14 @@ def main():
     print(f"  Realm ID:      {realm_id}")
     print(f"  Refresh Token: {refresh_token}")
 
-    # Write back to .env
+    # Write back to .env (handles both empty and existing values)
+    import re
     env_path = os.path.join(os.path.dirname(__file__), ".env")
     with open(env_path) as f:
         content = f.read()
 
-    content = content.replace("QBO_REALM_ID=", f"QBO_REALM_ID={realm_id}")
-    content = content.replace("QBO_REFRESH_TOKEN=", f"QBO_REFRESH_TOKEN={refresh_token}")
+    content = re.sub(r"^QBO_REALM_ID=.*$", f"QBO_REALM_ID={realm_id}", content, flags=re.MULTILINE)
+    content = re.sub(r"^QBO_REFRESH_TOKEN=.*$", f"QBO_REFRESH_TOKEN={refresh_token}", content, flags=re.MULTILINE)
 
     with open(env_path, "w") as f:
         f.write(content)
