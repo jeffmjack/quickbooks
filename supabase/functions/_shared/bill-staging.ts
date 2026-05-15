@@ -1,6 +1,17 @@
-// Shared bill staging logic: vendor matching, line item mapping, DB insertion
+// Shared bill staging logic: vendor matching, line item mapping, DB insertion.
+//
+// Intake dedupe runs in two layers:
+//   1. Same-doc-twice — same (vendor, invoice_number) already exists in Supabase.
+//      If totals + dates match, the new arrival is marked `ignored` pointing at the
+//      original. If they diverge, both rows stay pending and the new one carries a
+//      "Review needed: possible duplicate of #X" warning.
+//   2. Already-in-QBO — a Bill with same DocNumber + VendorRef exists in QBO
+//      (e.g. bookkeeper-keyed vendors like MYR). Marked `ignored` with qbo_bill_id
+//      stamped to the matched QBO Bill. Only runs when a QBOClient is passed in
+//      and the vendor is linked.
 
-import { similarity } from "./extraction.ts";
+import { similarity, validateExtraction } from "./extraction.ts";
+import { QBOClient } from "./qbo-client.ts";
 
 type SupabaseClient = {
   from: (table: string) => any;
@@ -15,6 +26,11 @@ type StagedResult = {
   error: string | null;
 };
 
+type StageOptions = {
+  /** When set, intake checks QBO for an existing Bill and auto-marks dupes as `ignored`. */
+  qboClient?: QBOClient;
+};
+
 export async function stageBill(
   sb: SupabaseClient,
   extracted: ExtractedInvoice,
@@ -27,6 +43,7 @@ export async function stageBill(
     email_from?: string | null;
     email_subject?: string | null;
   },
+  opts: StageOptions = {},
 ): Promise<StagedResult> {
   const vendorName = (extracted.vendor_name as string) || "Unknown";
 
@@ -122,13 +139,79 @@ export async function stageBill(
     });
   }
 
+  // Cross-check extraction arithmetic — surface OCR errors / missing surcharges
+  // as warnings instead of silently posting a wrong total to QBO later.
+  const warnings = validateExtraction(extracted);
+  const warningMessage = warnings.length
+    ? "Review needed: " + warnings.map((w) => w.message).join(" | ")
+    : null;
+
+  // Layer 1: same-doc-twice check (Supabase-side). Surfaces the Segovia 01344850
+  // pattern where the same paper invoice gets dropped into /genie twice.
+  const invoiceNumber = (extracted.invoice_number as string | null) || null;
+  const invoiceDate = (extracted.invoice_date as string | null) || null;
+  const totalAmount =
+    typeof extracted.total_amount === "number"
+      ? extracted.total_amount
+      : extracted.total_amount != null
+      ? Number(extracted.total_amount)
+      : null;
+
+  let sameDocDupId: number | null = null;
+  let sameDocMismatchNote: string | null = null;
+
+  if (vendorDbId !== null && invoiceNumber) {
+    const { data: priorBills } = await sb
+      .from("bills")
+      .select("id, total_amount, invoice_date, status")
+      .eq("vendor_id", vendorDbId)
+      .eq("invoice_number", invoiceNumber)
+      .neq("status", "error")
+      .order("id", { ascending: true })
+      .limit(5);
+
+    if (priorBills && priorBills.length > 0) {
+      const orig = priorBills[0];
+      const priorTotal = orig.total_amount != null ? Number(orig.total_amount) : null;
+      const totalsMatch =
+        totalAmount != null &&
+        priorTotal != null &&
+        Math.abs(priorTotal - totalAmount) < 0.02;
+      const datesMatch =
+        (orig.invoice_date ?? null) === (invoiceDate ?? null);
+
+      if (totalsMatch && datesMatch) {
+        sameDocDupId = orig.id;
+      } else {
+        sameDocMismatchNote =
+          `Possible duplicate of bill #${orig.id} ` +
+          `(prior: $${priorTotal} on ${orig.invoice_date ?? "?"}; ` +
+          `this: $${totalAmount} on ${invoiceDate ?? "?"}) — review`;
+      }
+    }
+  }
+
+  // Decide initial status + error_message before insert.
+  let initialStatus = "pending";
+  const messages: string[] = [];
+  if (warningMessage) messages.push(warningMessage);
+  if (sameDocDupId !== null) {
+    initialStatus = "ignored";
+    messages.unshift(
+      `Same-doc duplicate of bill #${sameDocDupId}. Auto-ignored at intake.`,
+    );
+  } else if (sameDocMismatchNote) {
+    messages.push("Review needed: " + sameDocMismatchNote);
+  }
+  const initialErrorMessage = messages.length ? messages.join(" | ") : null;
+
   // Insert the bill
   const { data: billData, error: billError } = await sb
     .from("bills")
     .insert({
       vendor_id: vendorDbId,
-      invoice_number: extracted.invoice_number || null,
-      invoice_date: extracted.invoice_date || null,
+      invoice_number: invoiceNumber,
+      invoice_date: invoiceDate,
       due_date: extracted.due_date || null,
       total_amount: extracted.total_amount || null,
       drive_file_id: fileRef.drive_file_id || null,
@@ -137,7 +220,8 @@ export async function stageBill(
       email_from: fileRef.email_from || null,
       email_subject: fileRef.email_subject || null,
       source,
-      status: "pending",
+      status: initialStatus,
+      error_message: initialErrorMessage,
       raw_extraction: extracted,
     })
     .select("id")
@@ -166,6 +250,43 @@ export async function stageBill(
       mapping_id: mapping.mapping_id,
       mapping_confidence: mapping.confidence,
     });
+  }
+
+  // Layer 2: QBO-side dedupe. Skip if we already ignored as a same-doc dup, or
+  // if the vendor isn't linked to QBO (no way to query). Best-effort: a QBO
+  // query failure here should not fail the whole intake — just log and continue.
+  if (initialStatus !== "ignored" && opts.qboClient) {
+    const vendor = vendorList.find((v) => v.id === vendorDbId);
+    const qboVendorId = vendor?.qbo_vendor_id ?? null;
+    if (qboVendorId) {
+      try {
+        const existing = await opts.qboClient.findBill(
+          qboVendorId,
+          invoiceNumber,
+          invoiceDate,
+          totalAmount,
+        );
+        if (existing) {
+          const note =
+            `Already in QBO as Bill ${existing.Id} ` +
+            `(DocNum=${existing.DocNumber ?? "N/A"}, $${existing.TotalAmt}, ${existing.TxnDate}, ` +
+            `balance $${existing.Balance ?? "?"}). Auto-ignored at intake.`;
+          const merged = initialErrorMessage
+            ? `${note} | ${initialErrorMessage}`
+            : note;
+          await sb
+            .from("bills")
+            .update({
+              status: "ignored",
+              qbo_bill_id: existing.Id,
+              error_message: merged,
+            })
+            .eq("id", billDbId);
+        }
+      } catch (e) {
+        console.warn(`[stageBill] QBO dedupe check failed for bill #${billDbId}:`, e);
+      }
+    }
   }
 
   return { billId: billDbId, error: null };

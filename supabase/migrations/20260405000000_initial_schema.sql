@@ -49,7 +49,13 @@ CREATE TABLE bills (
     drive_file_id       TEXT,               -- Google Drive file ID
     drive_file_name     TEXT,
     source              TEXT DEFAULT 'drive', -- 'drive' or 'gmail'
-    status              TEXT DEFAULT 'pending', -- 'pending','reviewed','posted','error'
+    status              TEXT DEFAULT 'pending',
+        -- 'pending'  — staged, awaiting human review
+        -- 'reviewed' — reviewer confirmed; ready to post
+        -- 'posted'   — pushed to QBO (or matched to an existing QBO bill at intake)
+        -- 'error'    — extraction or post failed
+        -- 'ignored'  — auto-deduped at intake (already in QBO, or scanned twice).
+        --              qbo_bill_id stamped if matched to an existing QBO record.
     error_message       TEXT,
     raw_extraction      JSONB,              -- full Claude extraction output
     created_at          TIMESTAMPTZ DEFAULT NOW()

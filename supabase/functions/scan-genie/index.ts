@@ -1,14 +1,21 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { extractInvoice } from "../_shared/extraction.ts";
 import { stageBill } from "../_shared/bill-staging.ts";
+import { QBOClient } from "../_shared/qbo-client.ts";
+import {
+  getOrCreateSubfolder,
+  listFolderFiles,
+  downloadFile,
+  moveFile,
+  splitFilename,
+} from "../_shared/drive.ts";
+import { captureEdgeError, flushSentry } from "../_shared/sentry.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
     "authorization, x-client-info, apikey, content-type",
 };
-
-// ── Google Drive helpers ────────────────────────────────────────────────────
 
 async function getGoogleAccessToken(): Promise<string> {
   const resp = await fetch("https://oauth2.googleapis.com/token", {
@@ -27,29 +34,6 @@ async function getGoogleAccessToken(): Promise<string> {
   return data.access_token;
 }
 
-async function listGenieFiles(token: string, folderId: string) {
-  const q = encodeURIComponent(
-    `'${folderId}' in parents and trashed=false and (mimeType='application/pdf' or mimeType contains 'image/')`,
-  );
-  const resp = await fetch(
-    `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,mimeType,modifiedTime)&orderBy=modifiedTime`,
-    { headers: { Authorization: `Bearer ${token}` } },
-  );
-  const data = await resp.json();
-  return data.files || [];
-}
-
-async function downloadFile(
-  token: string,
-  fileId: string,
-): Promise<ArrayBuffer> {
-  const resp = await fetch(
-    `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
-    { headers: { Authorization: `Bearer ${token}` } },
-  );
-  return resp.arrayBuffer();
-}
-
 // ── Main handler ────────────────────────────────────────────────────────────
 
 Deno.serve(async (req) => {
@@ -65,19 +49,27 @@ Deno.serve(async (req) => {
 
     const genieFolderId = Deno.env.get("GOOGLE_DRIVE_GENIE_FOLDER_ID")!;
 
-    // 1. Get Google access token
     const googleToken = await getGoogleAccessToken();
 
-    // 2. List files in Genie folder
-    const files = await listGenieFiles(googleToken, genieFolderId);
+    // Folder layout: /genie/bills/ → /genie/bills/processed/YYYY/ or /genie/bills/errors/
+    const billsFolderId = await getOrCreateSubfolder(googleToken, genieFolderId, "bills");
+    const processedFolderId = await getOrCreateSubfolder(googleToken, billsFolderId, "processed");
+    const errorsFolderId = await getOrCreateSubfolder(googleToken, billsFolderId, "errors");
+    const yearFolderId = await getOrCreateSubfolder(
+      googleToken,
+      processedFolderId,
+      String(new Date().getUTCFullYear()),
+    );
+
+    const files = await listFolderFiles(googleToken, billsFolderId);
     if (files.length === 0) {
       return new Response(
-        JSON.stringify({ message: "Genie folder is empty", bills: [] }),
+        JSON.stringify({ message: "/genie/bills/ is empty", bills: [] }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
     }
 
-    // 3. Filter out already-staged files
+    // Filter out already-staged files (idempotent re-scan)
     const newFiles = [];
     for (const f of files) {
       const { data } = await sb
@@ -95,13 +87,22 @@ Deno.serve(async (req) => {
       );
     }
 
-    // 4. Load vendors for matching
+    // Load vendors for matching
     const { data: dbVendors } = await sb
       .from("vendors")
       .select("id, qbo_vendor_id, name");
     const vendorList = dbVendors || [];
 
-    // 5. Process each file
+    // QBO is best-effort for intake dedupe; if init fails, we still stage bills.
+    let qbo: QBOClient | null = null;
+    try {
+      const candidate = new QBOClient(sb);
+      await candidate.init();
+      qbo = candidate;
+    } catch (e) {
+      console.warn("[scan-genie] QBO unavailable, skipping intake dedupe:", e);
+    }
+
     const results: { file: string; bills: number[]; errors: string[] }[] = [];
 
     for (const f of newFiles) {
@@ -116,10 +117,17 @@ Deno.serve(async (req) => {
         const invoices = await extractInvoice(fileBytes, f.mimeType, anthropicApiKey);
 
         for (const extracted of invoices) {
-          const staged = await stageBill(sb, extracted, vendorList, "genie", {
-            drive_file_id: f.id,
-            drive_file_name: f.name,
-          });
+          const staged = await stageBill(
+            sb,
+            extracted,
+            vendorList,
+            "genie",
+            {
+              drive_file_id: f.id,
+              drive_file_name: f.name,
+            },
+            { qboClient: qbo ?? undefined },
+          );
 
           if (staged.billId) {
             fileResult.bills.push(staged.billId);
@@ -127,8 +135,18 @@ Deno.serve(async (req) => {
             fileResult.errors.push(staged.error);
           }
         }
+
+        if (fileResult.bills.length > 0) {
+          const [base, ext] = splitFilename(f.name);
+          await moveFile(googleToken, f.id, billsFolderId, yearFolderId, `${base} (from scan)${ext}`);
+        } else if (fileResult.errors.length > 0) {
+          await moveFile(googleToken, f.id, billsFolderId, errorsFolderId);
+        }
       } catch (e) {
         fileResult.errors.push(`${e}`);
+        try {
+          await moveFile(googleToken, f.id, billsFolderId, errorsFolderId);
+        } catch { /* best effort */ }
       }
 
       results.push(fileResult);
@@ -145,6 +163,9 @@ Deno.serve(async (req) => {
       { headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );
   } catch (e) {
+    console.error("[scan-genie]", e);
+    captureEdgeError("scan-genie", e);
+    await flushSentry();
     return new Response(
       JSON.stringify({ error: `${e}` }),
       {

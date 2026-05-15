@@ -1,0 +1,14 @@
+# Vercel only needs the Vite app — everything below is local-only / server-only.
+supabase/
+scripts/
+*.py
+*.json
+!app/**
+!vercel.json
+!package.json
+google_token.json
+info_google_token.json
+.env
+.claude/
+.git/
+node_modules/

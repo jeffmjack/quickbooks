@@ -10,7 +10,7 @@ import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from '@/components/ui/table'
 import { Input } from '@/components/ui/input'
-import { FileText, ChevronLeft, AlertTriangle, CheckCircle2, Clock, XCircle, RefreshCw, Loader2, Mail, Link2, Plus } from 'lucide-react'
+import { FileText, ChevronLeft, AlertTriangle, CheckCircle2, Clock, XCircle, RefreshCw, Loader2, Mail, Link2, Plus, EyeOff } from 'lucide-react'
 
 const fmt = (n: number) =>
   n.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
@@ -234,6 +234,7 @@ const STATUS_CONFIG: Record<string, { label: string; variant: 'default' | 'secon
   reviewed: { label: 'Reviewed',       variant: 'secondary', icon: CheckCircle2 },
   posted:   { label: 'Posted to QBO',  variant: 'default', icon: CheckCircle2 },
   error:    { label: 'Error',          variant: 'outline', className: 'text-destructive border-destructive/40', icon: XCircle },
+  ignored:  { label: 'Ignored',        variant: 'outline', className: 'text-muted-foreground border-muted-foreground/30', icon: EyeOff },
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -327,7 +328,7 @@ function ScanButtons({ onComplete }: { onComplete: () => void }) {
 function BillList({ onSelect }: { onSelect: (id: number) => void }) {
   const [bills, setBills] = useState<Bill[]>([])
   const [loading, setLoading] = useState(true)
-  const [filter, setFilter] = useState<string | null>(null)
+  const [filter, setFilter] = useState<string | null>('pending')
   const [refreshKey, setRefreshKey] = useState(0)
 
   useEffect(() => {
@@ -338,7 +339,13 @@ function BillList({ onSelect }: { onSelect: (id: number) => void }) {
         .select('id, vendor_id, invoice_number, invoice_date, due_date, total_amount, status, error_message, drive_file_id, drive_file_name, email_message_id, email_from, email_subject, source, created_at, vendors(name, qbo_vendor_id)')
         .order('created_at', { ascending: false })
 
-      if (filter) query = query.eq('status', filter)
+      if (filter) {
+        query = query.eq('status', filter)
+      } else {
+        // Default view hides auto-deduped bills; they're available via the
+        // explicit "Ignored" filter for audit.
+        query = query.neq('status', 'ignored')
+      }
 
       const { data } = await query
       setBills((data || []).map((d: Record<string, unknown>) => normalizeBill(d)))
@@ -370,12 +377,21 @@ function BillList({ onSelect }: { onSelect: (id: number) => void }) {
     )
   }
 
-  const statuses = ['pending', 'reviewed', 'posted', 'error']
+  // Pending first (default landing — what needs attention), then All, then the
+  // rest. Order matches the typical workflow gaze: today's work → audit → done.
+  const statuses = ['reviewed', 'posted', 'error', 'ignored']
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div className="flex gap-2">
+          <Button
+            variant={filter === 'pending' ? 'default' : 'outline'}
+            size="sm"
+            onClick={() => setFilter('pending')}
+          >
+            {STATUS_CONFIG.pending.label}
+          </Button>
           <Button
             variant={filter === null ? 'default' : 'outline'}
             size="sm"
@@ -575,6 +591,14 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
     setBill((prev) => prev ? { ...prev, status: 'reviewed' } : prev)
   }
 
+  const unignore = async () => {
+    await supabase
+      .from('bills')
+      .update({ status: 'pending', qbo_bill_id: null, error_message: null })
+      .eq('id', billId)
+    setBill((prev) => prev ? { ...prev, status: 'pending', qbo_bill_id: null, error_message: null } : prev)
+  }
+
   const postToQBO = async () => {
     setPosting(true)
     setPostResult(null)
@@ -720,6 +744,18 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
         </Card>
       )}
 
+      {/* Ignored reason — auto-deduped at intake. */}
+      {bill.status === 'ignored' && bill.error_message && (
+        <Card>
+          <CardContent className="py-3">
+            <div className="flex items-start gap-2 text-muted-foreground">
+              <EyeOff className="size-4 mt-0.5 shrink-0" />
+              <p className="text-sm">{bill.error_message}</p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Line Items */}
       <Card>
         <CardHeader>
@@ -807,6 +843,19 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
           </Table>
         </CardContent>
       </Card>
+
+      {/* Un-ignore action for auto-deduped bills */}
+      {bill.status === 'ignored' && (
+        <div className="flex flex-wrap gap-3 items-center">
+          <Button variant="outline" onClick={unignore}>
+            <RefreshCw className="size-4 mr-1.5" />
+            Move back to Pending
+          </Button>
+          <p className="text-sm text-muted-foreground">
+            Use this if the dedupe was wrong and you want to review this bill.
+          </p>
+        </div>
+      )}
 
       {/* Actions */}
       {(bill.status === 'pending' || bill.status === 'reviewed') && (

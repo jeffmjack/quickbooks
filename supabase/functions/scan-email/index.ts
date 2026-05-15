@@ -1,6 +1,9 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { extractInvoice } from "../_shared/extraction.ts";
 import { stageBill } from "../_shared/bill-staging.ts";
+import { QBOClient } from "../_shared/qbo-client.ts";
+import { getOrCreateSubfolder, uploadFile } from "../_shared/drive.ts";
+import { captureEdgeError, flushSentry } from "../_shared/sentry.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -100,6 +103,29 @@ async function markAsRead(token: string, messageId: string): Promise<void> {
   });
 }
 
+/**
+ * After staging a bill from email: archive the message and ensure the `bill`
+ * label is applied so it stays searchable from the Gmail label sidebar.
+ * Inbox stays clean; nothing is lost.
+ */
+async function markBillEmailHandled(
+  token: string,
+  messageId: string,
+  alreadyHasBillLabel: boolean,
+): Promise<void> {
+  await fetch(`${GMAIL_BASE}/messages/${messageId}/modify`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      addLabelIds: alreadyHasBillLabel ? undefined : ["Label_5800834809592445520"],
+      removeLabelIds: ["UNREAD", "INBOX"],
+    }),
+  });
+}
+
 async function archiveMessage(token: string, messageId: string): Promise<void> {
   await fetch(`${GMAIL_BASE}/messages/${messageId}/modify`, {
     method: "POST",
@@ -192,98 +218,6 @@ function extractBodyText(parts: GmailPart[] | undefined): string {
   return "";
 }
 
-// ── Drive helpers ───────────────────────────────────────────────────────────
-
-const RECEIPTS_ROOT = "1pFDsBZ2ktag8bd-RNUwNfbCyoyHwhBaO";
-
-const YEAR_FOLDER_IDS: Record<string, string> = {
-  "2024": "1GSGsmtAmSs9PFluYUzrwI4SwizBLn_Ld",
-  "2025": "1QoJQW-pQWL0A_gFEX_6x7WccvNimxh7x",
-  "2026": "1TmZEDrU6RKyAMK5HvcXZqWPjBs3rXJ4B",
-};
-
-async function getOrCreateYearFolder(
-  token: string,
-  year: string,
-): Promise<string> {
-  if (YEAR_FOLDER_IDS[year]) return YEAR_FOLDER_IDS[year];
-
-  // Check if it exists
-  const q = encodeURIComponent(
-    `'${RECEIPTS_ROOT}' in parents and name='${year}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-  );
-  const resp = await fetch(
-    `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id)`,
-    { headers: { Authorization: `Bearer ${token}` } },
-  );
-  const data = await resp.json();
-  if (data.files && data.files.length > 0) {
-    YEAR_FOLDER_IDS[year] = data.files[0].id;
-    return data.files[0].id;
-  }
-
-  // Create it
-  const createResp = await fetch("https://www.googleapis.com/drive/v3/files", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      name: year,
-      mimeType: "application/vnd.google-apps.folder",
-      parents: [RECEIPTS_ROOT],
-    }),
-  });
-  const created = await createResp.json();
-  YEAR_FOLDER_IDS[year] = created.id;
-  return created.id;
-}
-
-async function uploadToDrive(
-  token: string,
-  fileBytes: ArrayBuffer,
-  filename: string,
-  mimeType: string,
-  folderId: string,
-): Promise<string> {
-  const metadata = JSON.stringify({ name: filename, parents: [folderId] });
-  const boundary = "----FormBoundary" + Math.random().toString(36).slice(2);
-
-  const metaPart =
-    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n`;
-  const filePart = `--${boundary}\r\nContent-Type: ${mimeType}\r\nContent-Transfer-Encoding: binary\r\n\r\n`;
-  const closing = `\r\n--${boundary}--`;
-
-  const encoder = new TextEncoder();
-  const metaBytes = encoder.encode(metaPart);
-  const filePartBytes = encoder.encode(filePart);
-  const closingBytes = encoder.encode(closing);
-  const fileArr = new Uint8Array(fileBytes);
-
-  const body = new Uint8Array(
-    metaBytes.length + filePartBytes.length + fileArr.length + closingBytes.length,
-  );
-  body.set(metaBytes, 0);
-  body.set(filePartBytes, metaBytes.length);
-  body.set(fileArr, metaBytes.length + filePartBytes.length);
-  body.set(closingBytes, metaBytes.length + filePartBytes.length + fileArr.length);
-
-  const resp = await fetch(
-    "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": `multipart/related; boundary=${boundary}`,
-      },
-      body,
-    },
-  );
-  const result = await resp.json();
-  return result.id;
-}
-
 // ── Triage ──────────────────────────────────────────────────────────────────
 
 type TriageResult = "bill" | "payment_advice" | "customer" | "junk";
@@ -352,6 +286,17 @@ Deno.serve(async (req) => {
     const sb = createClient(supabaseUrl, serviceRoleKey);
 
     const googleToken = await getGoogleAccessToken();
+    const genieFolderId = Deno.env.get("GOOGLE_DRIVE_GENIE_FOLDER_ID")!;
+    // Email-sourced bills bypass the classifier (Gmail label is authoritative)
+    // and land directly in /genie/bills/processed/YYYY/ or /genie/bills/errors/.
+    const billsFolderId = await getOrCreateSubfolder(googleToken, genieFolderId, "bills");
+    const processedRootId = await getOrCreateSubfolder(googleToken, billsFolderId, "processed");
+    const processedFolderId = await getOrCreateSubfolder(
+      googleToken,
+      processedRootId,
+      String(new Date().getUTCFullYear()),
+    );
+    const errorsFolderId = await getOrCreateSubfolder(googleToken, billsFolderId, "errors");
 
     // 1. List unread messages
     const messageStubs = await listUnreadMessages(googleToken);
@@ -367,6 +312,16 @@ Deno.serve(async (req) => {
       .from("vendors")
       .select("id, qbo_vendor_id, name");
     const vendorList = dbVendors || [];
+
+    // QBO is best-effort for intake dedupe; if init fails, we still stage bills.
+    let qbo: QBOClient | null = null;
+    try {
+      const candidate = new QBOClient(sb);
+      await candidate.init();
+      qbo = candidate;
+    } catch (e) {
+      console.warn("[scan-email] QBO unavailable, skipping intake dedupe:", e);
+    }
 
     const results: {
       email: string;
@@ -422,6 +377,8 @@ Deno.serve(async (req) => {
       }
       emailResult.category = category;
 
+      const hasBillLabel = labels.includes(LABEL_BILL);
+
       switch (category) {
         case "bill": {
           // Check if already processed
@@ -431,7 +388,7 @@ Deno.serve(async (req) => {
             .eq("email_message_id", stub.id);
           if (existing && existing.length > 0) {
             emailResult.action = "already_processed";
-            await markAsRead(googleToken, stub.id);
+            await markBillEmailHandled(googleToken, stub.id, hasBillLabel);
             break;
           }
 
@@ -465,17 +422,44 @@ Deno.serve(async (req) => {
                     email_from: from,
                     email_subject: subject,
                   },
+                  { qboClient: qbo ?? undefined },
                 );
-                if (staged.billId) emailResult.bills.push(staged.billId);
-                else if (staged.error) emailResult.errors.push(staged.error);
+                if (staged.billId) {
+                  emailResult.bills.push(staged.billId);
+                  // Archive attachment to Processed folder
+                  const vendor = (extracted.vendor_name as string) || "Unknown";
+                  const inv = (extracted.invoice_number as string) || "no-inv";
+                  const ext = att.filename.includes(".") ? att.filename.slice(att.filename.lastIndexOf(".")) : ".pdf";
+                  const archiveName = `${vendor} - ${inv} (from email)${ext}`;
+                  await uploadFile(googleToken, fileBytes, archiveName, att.mimeType, processedFolderId);
+                } else if (staged.error) {
+                  emailResult.errors.push(staged.error);
+                  // Archive to Errors folder
+                  const errName = `${att.filename.replace(/\.[^.]+$/, "")} (from email)${att.filename.includes(".") ? att.filename.slice(att.filename.lastIndexOf(".")) : ""}`;
+                  await uploadFile(googleToken, fileBytes, errName, att.mimeType, errorsFolderId);
+                }
               }
             } catch (e) {
               emailResult.errors.push(`Attachment ${att.filename}: ${e}`);
+              // Try to save to Errors — best effort
+              try {
+                const fileBytes = await getAttachment(googleToken, stub.id, att.attachmentId);
+                const errName = `${att.filename.replace(/\.[^.]+$/, "")} (from email)${att.filename.includes(".") ? att.filename.slice(att.filename.lastIndexOf(".")) : ""}`;
+                await uploadFile(googleToken, fileBytes, errName, att.mimeType, errorsFolderId);
+              } catch { /* best effort */ }
             }
           }
 
           emailResult.action = `staged_${emailResult.bills.length}_bills`;
-          await markAsRead(googleToken, stub.id);
+          // Archive + ensure `bill` label is applied. Keeps the inbox clean and
+          // discoverable via the label sidebar; nothing is lost from Gmail.
+          if (emailResult.bills.length > 0) {
+            await markBillEmailHandled(googleToken, stub.id, hasBillLabel);
+          } else {
+            // No bills successfully staged (extraction error etc.) — leave in
+            // inbox for human follow-up, just mark read.
+            await markAsRead(googleToken, stub.id);
+          }
           break;
         }
 
@@ -537,6 +521,9 @@ Deno.serve(async (req) => {
       { headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );
   } catch (e) {
+    console.error("[scan-email]", e);
+    captureEdgeError("scan-email", e);
+    await flushSentry();
     return new Response(
       JSON.stringify({ error: `${e}` }),
       {
