@@ -5,6 +5,9 @@ __pycache__/
 *.pyc
 google_credentials.json
 google_token.json
+info_google_token.json
+*_google_token.json
+.DS_Store
 
 # Vite app
 app/node_modules/
