@@ -17,7 +17,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { parseRampEmail } from "../_shared/ramp-parser.ts";
-import { captureEdgeError, flushSentry } from "../_shared/sentry.ts";
+import { captureEdgeError, captureEdgeMessage, flushSentry } from "../_shared/sentry.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -139,6 +139,7 @@ Deno.serve(async (req) => {
     let skippedUnrecognized = 0;
     let skippedAp = 0;
     const errors: string[] = [];
+    const unrecognizedSubjects: string[] = [];
 
     for (const stub of stubs) {
       try {
@@ -152,6 +153,9 @@ Deno.serve(async (req) => {
         const parsed = parseRampEmail(subject, body);
         if (!parsed) {
           skippedUnrecognized++;
+          if (unrecognizedSubjects.length < 20) {
+            unrecognizedSubjects.push(subject);
+          }
           continue;
         }
 
@@ -246,6 +250,21 @@ Deno.serve(async (req) => {
       }
     }
 
+    // Drift detection: if we couldn't classify any subjects, alert. Ramp
+    // changes their email language periodically (we already migrated through
+    // "Payment initiated/delivered" → "[Instant eligible]/Payment received").
+    // Without this we'd silently drop new events for weeks.
+    if (unrecognizedSubjects.length > 0) {
+      const sample = Array.from(new Set(unrecognizedSubjects)).slice(0, 10);
+      captureEdgeMessage(
+        "scan-ramp",
+        `Ramp emails with unrecognized subject patterns (${skippedUnrecognized}) — parser may need updating.`,
+        "warning",
+        { sampleSubjects: sample },
+      );
+      await flushSentry();
+    }
+
     return new Response(
       JSON.stringify({
         message: `Scanned ${stubs.length} Ramp email(s): ${staged} staged, ${skippedDup} duplicates, ${skippedUnrecognized} unrecognized, ${skippedAp} AP-side (parked), ${errors.length} error(s)`,
@@ -254,6 +273,7 @@ Deno.serve(async (req) => {
         skipped_duplicate: skippedDup,
         skipped_unrecognized: skippedUnrecognized,
         skipped_ap: skippedAp,
+        unrecognized_subjects: Array.from(new Set(unrecognizedSubjects)).slice(0, 10),
         errors,
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } },

@@ -33,10 +33,12 @@ CREATE TABLE ramp_payments (
     qbo_receive_payment_id   TEXT UNIQUE,             -- set after successful post
 
     status                   TEXT DEFAULT 'pending',
-        -- 'pending'  — staged, not yet posted (or not yet eligible — only `delivered` is posted)
-        -- 'posted'   — Receive Payment created in QBO
-        -- 'error'    — match or post failed
-        -- 'ignored'  — out-of-scope event (AP, or `initiated` superseded by `delivered`)
+        -- 'pending'  — staged, awaiting post-ramp-payment to pick it up
+        -- 'posted'   — Receive Payment created in QBO (qbo_receive_payment_id stamped)
+        -- 'review'   — auto-post declined: invoice missing, already closed, ambiguous,
+        --              or amount didn't match Invoice.Balance. Human decides next step.
+        -- 'error'    — QBO call failed unexpectedly; safe to retry after fixing root cause
+        -- 'ignored'  — out-of-scope at intake (AP event, or `initiated` not yet `delivered`)
     error_message            TEXT,
 
     email_message_id         TEXT,                    -- Gmail msgid of the event we parsed
