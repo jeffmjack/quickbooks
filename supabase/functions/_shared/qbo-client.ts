@@ -79,7 +79,13 @@ export class QBOClient {
     }
   }
 
-  /** Internal: make an authenticated request, retry once on 401. */
+  /**
+   * Internal: make an authenticated request. Retries once on 401 (token expiry)
+   * and up to twice on transient QBO infrastructure faults — HTTP 5xx and QBO
+   * Fault codes 4002 ("Error processing query") and 10000 ("SystemFailureError").
+   * QBO's hosted query layer is intermittently flaky; without retries a single
+   * blip on the dupe-check query bricks a bill into status='error'.
+   */
   private async _request(
     method: "GET" | "POST",
     path: string,
@@ -112,6 +118,20 @@ export class QBOClient {
     // Retry once on 401 — token may have expired mid-session
     if (resp.status === 401) {
       await this._refreshAccessToken();
+      resp = await doRequest();
+    }
+
+    // Transient-fault retry loop: HTTP 5xx, or 4xx body carrying QBO codes
+    // 4002 / 10000. We attempt up to 2 retries with linear backoff (~1s, ~2s).
+    // POST is only retried when the response code is a clean 5xx without a
+    // QBO 'Bill' / entity body — bill posts include enough idempotency context
+    // (DocNumber + Vendor) that the next find/post cycle is safe; here we just
+    // bail out conservatively for non-GET to avoid double-create risk.
+    for (let attempt = 1; attempt <= 2 && !resp.ok; attempt++) {
+      const cloned = resp.clone();
+      const text = await cloned.text();
+      if (!isTransientQboFault(resp.status, text) || method !== "GET") break;
+      await new Promise((r) => setTimeout(r, attempt * 1000));
       resp = await doRequest();
     }
 
@@ -286,6 +306,19 @@ export class QBOClient {
   get companyId(): string {
     return this.realmId;
   }
+}
+
+/**
+ * QBO returns its "service is having a moment" failures as either HTTP 5xx
+ * or as 4xx with a Fault body carrying code "4002" (query layer) or "10000"
+ * (SystemFailureError). These are not real validation problems — retry safely.
+ */
+function isTransientQboFault(status: number, body: string): boolean {
+  if (status >= 500 && status < 600) return true;
+  if (status >= 400 && status < 500) {
+    return /"code"\s*:\s*"(4002|10000)"/.test(body);
+  }
+  return false;
 }
 
 export class QBOApiError extends Error {

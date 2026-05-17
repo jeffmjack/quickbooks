@@ -625,6 +625,15 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
     await postToQBO()
   }
 
+  const retryFromError = async () => {
+    await supabase
+      .from('bills')
+      .update({ status: 'pending', error_message: null })
+      .eq('id', billId)
+    setBill((prev) => prev ? { ...prev, status: 'pending', error_message: null } : prev)
+    await postToQBO()
+  }
+
   if (loading || !bill) {
     return <p className="text-sm text-muted-foreground">Loading...</p>
   }
@@ -854,6 +863,29 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
           <p className="text-sm text-muted-foreground">
             Use this if the dedupe was wrong and you want to review this bill.
           </p>
+        </div>
+      )}
+
+      {/* Recovery action for bills that errored on a prior post attempt.
+          Common cause: transient QBO query fault (codes 4002 / 10000) during
+          dupe-check. Retrying re-runs dupe detection, so an actual duplicate
+          gets marked posted instead of re-creating in QBO. */}
+      {bill.status === 'error' && (
+        <div className="flex flex-wrap gap-3 items-center">
+          <Button onClick={retryFromError} disabled={unmapped.length > 0 || posting}>
+            {posting ? <Loader2 className="size-4 mr-1.5 animate-spin" /> : <RefreshCw className="size-4 mr-1.5" />}
+            Retry post to QBO
+          </Button>
+          {unmapped.length > 0 && (
+            <p className="text-sm text-muted-foreground">
+              Assign all categories before retrying
+            </p>
+          )}
+          {postResult && (
+            <p className={`text-sm ${postResult.isError ? 'text-destructive' : 'text-muted-foreground'}`}>
+              {postResult.message}
+            </p>
+          )}
         </div>
       )}
 
