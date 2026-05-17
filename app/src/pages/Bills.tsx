@@ -612,7 +612,16 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
         throw new Error(body?.error || error.message || `${error}`)
       }
       setPostResult({ message: data.message, isError: false })
-      setBill((prev) => prev ? { ...prev, status: 'posted', qbo_bill_id: data.qbo_bill_id } : prev)
+      // Duplicate-in-QBO is routed to 'ignored' on the server (with a reason
+      // in error_message) so it leaves the active worklist; everything else
+      // is a fresh successful post.
+      const isDuplicate = data.duplicate === true
+      setBill((prev) => prev ? {
+        ...prev,
+        status: isDuplicate ? 'ignored' : 'posted',
+        qbo_bill_id: data.qbo_bill_id,
+        ...(isDuplicate ? { error_message: data.message } : {}),
+      } : prev)
     } catch (e: any) {
       setPostResult({ message: e.message || `Post failed: ${e}`, isError: true })
     } finally {
