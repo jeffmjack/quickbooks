@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { supabase } from '@/lib/supabase'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -929,7 +930,14 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
 // ── Main ────────────────────────────────────────────────────────────────────
 
 export default function Bills() {
-  const [selectedBillId, setSelectedBillId] = useState<number | null>(null)
+  // Selected bill lives in the URL so the sidebar NavLink to /bills (no query)
+  // collapses the detail view back to the list.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const idParam = searchParams.get('id')
+  const selectedBillId = idParam ? Number(idParam) : null
+
+  const selectBill = (id: number) => setSearchParams({ id: String(id) })
+  const clearSelection = () => setSearchParams({})
 
   return (
     <div>
@@ -941,10 +949,10 @@ export default function Bills() {
               Review and approve staged invoices before posting to QBO.
             </p>
           </div>
-          <BillList onSelect={setSelectedBillId} />
+          <BillList onSelect={selectBill} />
         </>
       ) : (
-        <BillDetail billId={selectedBillId} onBack={() => setSelectedBillId(null)} />
+        <BillDetail billId={selectedBillId} onBack={clearSelection} />
       )}
     </div>
   )
