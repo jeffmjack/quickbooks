@@ -42,6 +42,9 @@ supabase/
   migrations/           # Postgres migrations (applied in order)
   config.toml           # Local dev config
 *.py                    # QBO/payroll Python scripts (root level, being phased out)
+scripts/                # One-off analysis + cleanup scripts, organized by dated folder
+                        # e.g. scripts/cash-bleed-analysis-2026-05-18/ — books cleanup, CF model refresh, payroll accrual
+                        # Permanent automated work should live as edge functions; scripts/ is for ad-hoc + investigation
 vercel.json             # Vercel deploy config (SPA rewrite)
 ```
 
@@ -90,7 +93,8 @@ Ramp emails `billing@thegreencart.com` whenever a customer pays Green Cart via R
 - **Centralized OAuth:** `_shared/qbo-client.ts` is the single point of contact for all QBO API calls. Refresh token stored in `qbo_tokens` table (singleton row), not `.env`. Token rotation persisted to DB automatically.
 - **Bill posting:** `post-bill` edge function validates bill, checks for duplicates in QBO (by invoice # + vendor, or date + amount), posts via QBO Bill API with `AccountBasedExpenseLineDetail`.
 - **Vendor sync:** `sync-vendors` pulls all QBO vendors into the `vendors` table. `link-vendor` links/merges Supabase vendors to QBO vendors or creates new ones.
-- **Dupe detection:** Before posting, checks QBO for existing bill by DocNumber+Vendor, then falls back to Vendor+Date+Amount.
+- **Dupe detection:** Before posting, `post-bill` checks QBO for an existing bill by DocNumber+Vendor, then falls back to Vendor+Date+Amount. On match, the Supabase row is moved to `status='ignored'` with `error_message='Already in QBO as bill #N…'` (same bucket as auto-deduped intake bills), `qbo_bill_id` set to the existing QBO bill for audit. The "Move back to Pending" button on the bill detail page recovers from a false-positive match.
+- **Transient QBO query faults retry automatically.** `_shared/qbo-client.ts` retries GETs up to 2x (1s, 2s backoff) on HTTP 5xx and on QBO Fault codes `4002` / `10000`. POST is not retried — `post-bill`'s next dupe-check + post cycle is the safe re-entry. Without this, a single QBO blip on the dupe-check query bricked bills into `status='error'`.
 - **Re-auth:** Use Intuit OAuth Playground to get new refresh token, then update `qbo_tokens` table.
 
 ## Key architecture decisions
@@ -111,6 +115,7 @@ Ramp emails `billing@thegreencart.com` whenever a customer pays Green Cart via R
 - Edge functions (via `supabase secrets set`): `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_REFRESH_TOKEN`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_DRIVE_GENIE_FOLDER_ID`, `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET`, `SENTRY_DSN_EDGE` (optional), `SENTRY_ENVIRONMENT` (optional, defaults to "production")
 - QBO refresh token + realm ID: stored in `qbo_tokens` table, NOT in env vars
 - Python scripts: `.env` in root with QBO tokens, Supabase keys (legacy)
+- Homebase API (used by monthly payroll accrual scripts): `HOMEBASE_API_KEY` and `HOMEBASE_LOCAITON_UUID` in `.env` (typo intentional; scripts handle both spellings)
 
 ## Observability
 
