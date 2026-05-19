@@ -622,6 +622,7 @@ function BillDetail({ billId, onBack }: { billId: number; onBack: () => void }) 
         qbo_bill_id: data.qbo_bill_id,
         ...(isDuplicate ? { error_message: data.message } : {}),
       } : prev)
+      onBack()
     } catch (e: any) {
       setPostResult({ message: e.message || `Post failed: ${e}`, isError: true })
     } finally {
